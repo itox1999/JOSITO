@@ -18,7 +18,7 @@ def read_item(item_id: int, q: Optional[str] = None):
     return {"item_id": item_id, "q": q}
 
 # === WEBHOOK META (recomendado usar /webhook, no "/") ===
-VERIFY_TOKEN = "pon-tu-token-aqui"
+VERIFY_TOKEN = "josito"
 
 # Verificación (GET)
 @app.get("/webhook", response_class=PlainTextResponse)
