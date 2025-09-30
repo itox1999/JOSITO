@@ -1,21 +1,28 @@
 import os, hmac, hashlib, json, sqlite3
 from contextlib import contextmanager
-from fastapi import FastAPI, Request, Header, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, Header, HTTPException, BackgroundTasks, Query
 from fastapi.responses import PlainTextResponse
 import uvicorn, httpx
 
 app = FastAPI()
 
-VERIFY_TOKEN = "josito"
-WABA_TOKEN   = 'EAAUZARzoZC4moBPsNF9iX2VVKpDYYv00NoOR0SNqtRM0HjXPMfcGitPVIdTbH0ndwo30D0or4HACf5HUMu1ApQBLDDOztdHZBdcrY81566Fa4YZA4byfZBcqDsDcF6YupH9pVZCgZCmQsUroRxHVyJK3XaNZB2nRZCB6wQ4H742RJZAz8NsPzm90Kd17FdacQCNlzXVYZBbK1Dp0gsZAVIsOjP6REJ68r9IFNdO2I1xHZAgNUH6PN4ywZD'
-APP_SECRET   = 'd1f05b3acbeb8c7af7ba1371b9006794'
-GRAPH_VER    = "v22.0"
-OPENAI_API_KEY = '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'
+# === Lee todo desde variables de entorno ===
+VERIFY_TOKEN     = os.getenv("VERIFY_TOKEN", "")
+WABA_TOKEN       = os.getenv("WABA_TOKEN", "")
+APP_SECRET       = os.getenv("APP_SECRET", "")
+GRAPH_VER        = os.getenv("GRAPH_VER", "v22.0")
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
+DB_PATH          = os.getenv("DB_PATH", "data.db")
 
-DB_PATH = os.getenv("DB_PATH", "data.db")
+# Pequeña validación (opcional, pero útil):
+REQUIRED_VARS = ["VERIFY_TOKEN", "WABA_TOKEN", "APP_SECRET", "OPENAI_API_KEY"]
+missing = [k for k in REQUIRED_VARS if not os.getenv(k)]
+if missing:
+    print(f"[WARN] Faltan variables de entorno: {missing}")
 
 @contextmanager
 def db():
+    # Nota: en Render el sistema de archivos es efímero sin disco persistente
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     try:
         yield con
@@ -31,7 +38,8 @@ def init_db():
             from_wa TEXT,
             ts TEXT,
             type TEXT
-        )""")
+        )
+        """)
 init_db()
 
 def verify_signature(app_secret: str, payload: bytes, signature: str) -> bool:
@@ -47,23 +55,20 @@ async def send_text(phone_number_id: str, to_msisdn: str, text: str):
         "messaging_product": "whatsapp",
         "to": to_msisdn,
         "type": "text",
-        "text": {"body": text}
+        "text": {"body": text[:4096]}  # límite prudente
     }
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(url, headers=headers, json=payload)
         print("Send response:", r.status_code, r.text)
 
 async def ask_gpt(message: str) -> str:
-    """
-    Llama a la API de OpenAI para generar la respuesta.
-    """
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "gpt-4o-mini",  # usa el modelo que prefieras
+        "model": "gpt-4o-mini",
         "messages": [
             {"role": "system", "content": "Eres un asistente útil que responde brevemente."},
             {"role": "user", "content": message}
@@ -82,8 +87,10 @@ def already_processed(msg_id: str) -> bool:
 
 def mark_processed(msg_id: str, from_wa: str, ts: str, mtype: str):
     with db() as con:
-        con.execute("INSERT OR IGNORE INTO processed_messages(id, from_wa, ts, type) VALUES (?,?,?,?)",
-                    (msg_id, from_wa, ts, mtype))
+        con.execute(
+            "INSERT OR IGNORE INTO processed_messages(id, from_wa, ts, type) VALUES (?,?,?,?)",
+            (msg_id, from_wa, ts, mtype)
+        )
 
 async def handle_message(value: dict, msg: dict):
     phone_number_id = value.get("metadata", {}).get("phone_number_id")
@@ -91,56 +98,74 @@ async def handle_message(value: dict, msg: dict):
     msg_type = msg.get("type")
 
     if msg_type == "text":
-        text = msg.get("text", {}).get("body", "")
+        text = msg.get("text", {}).get("body", "") or ""
         print(f"[TEXT] {from_wa}: {text}")
 
-        # ---- Aquí va la llamada a GPT ----
-        reply = await ask_gpt(text)
+        # Llama a GPT y responde
+        try:
+            reply = await ask_gpt(text)
+        except Exception as e:
+            print("[GPT ERROR]", e)
+            reply = "Lo siento, tuve un problema procesando tu mensaje."
 
-        # Enviar la respuesta a WhatsApp
-        if phone_number_id and from_wa:
+        if phone_number_id and from_wa and reply:
             await send_text(phone_number_id, from_wa, reply)
 
 @app.get("/", response_class=PlainTextResponse)
 def root():
     return "OK"
 
+# GET de verificación con alias correctos para hub.*
 @app.get("/webhook", response_class=PlainTextResponse)
-async def verify(hub_mode: str | None = None,
-                 hub_challenge: str | None = None,
-                 hub_verify_token: str | None = None):
+async def verify(
+    hub_mode: str | None = Query(default=None, alias="hub.mode"),
+    hub_challenge: str | None = Query(default=None, alias="hub.challenge"),
+    hub_verify_token: str | None = Query(default=None, alias="hub.verify_token"),
+):
     if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
         return hub_challenge or ""
     raise HTTPException(status_code=403, detail="Verification failed")
 
+# POST del webhook con alias correcto para la cabecera X-Hub-Signature-256
 @app.post("/webhook")
-async def receive(request: Request,
-                  background: BackgroundTasks,
-                  x_hub_signature_256: str | None = Header(default=None)):
+async def receive(
+    request: Request,
+    background: BackgroundTasks,
+    x_hub_signature_256: str | None = Header(default=None, alias="X-Hub-Signature-256")
+):
     raw = await request.body()
 
     if APP_SECRET:
         if not x_hub_signature_256 or not verify_signature(APP_SECRET, raw, x_hub_signature_256):
             raise HTTPException(status_code=401, detail="Invalid signature")
 
-    data = json.loads(raw or "{}")
+    try:
+        data = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
     for entry in data.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
-            for msg in value.get("messages", []) or []:
+            messages = value.get("messages") or []
+            for msg in messages:
                 msg_id = msg.get("id")
                 from_wa = msg.get("from")
                 ts = msg.get("timestamp")
                 mtype = msg.get("type")
 
+                if not msg_id:
+                    continue
                 if already_processed(msg_id):
                     continue
-                mark_processed(msg_id, from_wa, ts, mtype)
+                mark_processed(msg_id, from_wa or "", ts or "", mtype or "")
+
+                # Manejo asíncrono para no bloquear el webhook
                 background.add_task(handle_message, value, msg)
 
     return {"status": "ok"}
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
+    # En Render usar host 0.0.0.0
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
